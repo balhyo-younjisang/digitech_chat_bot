@@ -1,19 +1,24 @@
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
 import uvicorn
-
+import openai
+import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
+openai.api_key = os.getenv('OPENAI_API_KEY')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-class KakaoRequest(BaseModel):
-    userRequest : dict
-
 app = FastAPI()
+
+faiss_index_path = "./faiss_index"
+vector_db = FAISS.load_local(faiss_index_path, HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"), allow_dangerous_deserialization=True)
 
 @app.post("/why-digitech")
 def why_digitech(request : Request):
@@ -74,22 +79,75 @@ def apply_middleschool_experience(request : Request):
     }
 
 @app.post("/message")
-async def message(request : Request):
+async def message(request : Request, background_tasks : BackgroundTasks):
+    """사용자 질문을 받아 RAG 기반 검색 및 LLM 응답 생성"""
     kakao_request = await request.json()
     user_message = kakao_request['userRequest']['utterance']
-    response_text = process_message(user_message)
+    callback_url = kakao_request['userRequest']['callbackUrl']
+
+    # 벡터 DB에서 관련 문서 검색
+    docs = vector_db.similarity_search(user_message, k=10)
+
+    # 검색된 문서의 텍스트 가져오기
+    context = "\n".join([doc.page_content for doc in docs])    
+
+    background_tasks.add_task(process_llm_response, user_message, context, callback_url)
+
     return {
         "version": "2.0",
-        "template": {
-            "outputs": [
-                {
-                    "simpleText": {
-                        "text": response_text
-                    }
-                }
-            ]
+        "useCallback": True,
+        "data": {
+            "msg":"답변을 입력중입니다..."
         }
     }
+    
+async def process_llm_response(user_message : str, context : str, callback_url : str):
+     # Llama 모델에 전달할 메시지 생성
+    prompt = f"""
+        너는 서울디지텍고등학교에 대한 정보를 제공하는 챗봇이야.  
+        학생, 학부모, 교사들에게 학교에 대한 정확하고 유용한 정보를 제공해야 해.  
+        반드시 **한국어**로만 답변해. 영어를 사용하지 마.
+
+        **규칙:**  
+        - 서울디지텍고등학교(Seoul Digitech High School)에 대한 정보를 제공해.  
+        - 친절하고 이해하기 쉽게 설명해야 해.  
+        - 질문이 모호하면 정중하게 다시 물어봐.  
+        - 제공된 정보(context) 내에서만 답변해야 해.  
+
+        **학교 정보:**  
+        {context}
+
+
+        ** 질문 **:
+        {user_message}
+
+        ** 답변 **:
+    """
+
+    # response = ollama.chat(model="llama3.2:1b", messages=[{"role": "user", "content": prompt}])\
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7
+    )
+
+    try:
+        httpx.post(callback_url, json={
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": response["choices"][0]["message"]["content"]
+                        }   
+                    }
+                ]
+            }
+        })
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail="Failed to calback data")
+
+
 
 @app.post("/get-banner")
 async def getBannerList(request : Request):
@@ -154,9 +212,6 @@ async def getBannerList(request : Request):
             ]
         }
     }
-
-def process_message(user_message: str) -> str:
-    return f"사용자님이 {user_message}라고 말씀하셨어요"
 
 if __name__ == '__main__' :
     uvicorn.run('main:app', host='0.0.0.0', port=8080, reload=True)
