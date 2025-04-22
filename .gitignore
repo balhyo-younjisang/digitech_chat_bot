@@ -1,3 +1,4 @@
 digitech-chatbot/
 __pycache__/
 .env
+nohup.out
