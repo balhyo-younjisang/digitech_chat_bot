@@ -29,7 +29,7 @@ def create_faiss_index(chunks):
     return index
 
 # PDF 파일 경로 설정
-pdf_path = "./digitech_qna.pdf"
+pdf_path = "./files/digitech_qna.pdf"
 text = load_pdf_text(pdf_path)
 chunks = split_text(text)
 

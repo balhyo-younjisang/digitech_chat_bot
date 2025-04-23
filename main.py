@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends, File, UploadFile
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import HTTPBasic
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pathlib import Path
@@ -16,10 +16,22 @@ import os
 import logging
 from dotenv import load_dotenv
 import pymupdf 
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.requests import Request
+from pydantic import BaseModel
+from langchain_core.documents import Document
+import uuid
+import json
+
+# 로그인 요청 바디 모델 정의
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 
 load_dotenv()
 openai.api_key = os.getenv('OPENAI_API_KEY')
+session_key = os.getenv("SESSION_KEY", "sessionsecret")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,10 +40,17 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], 
+    allow_origins=["http://localhost:5173", "https://digitech-chatbot-admin.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],  # 모든 HTTP 메서드 허용
     allow_headers=["*"],  # 모든 헤더 허용
+)
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=session_key,  # 세션에 사용할 비밀 키
+    same_site="none",  # 운영에서는 none
+    https_only=True # 운영에서는 True
 )
 
 security = HTTPBasic()
@@ -66,14 +85,13 @@ else:
     vector_db = FAISS.from_documents(documents, embedding_model)
     vector_db.save_local(faiss_index_path)
 
-def verify_user(credentials: HTTPBasicCredentials = Depends(security)):
-    is_valid_user = secrets.compare_digest(credentials.username, ADMIN_USER)
-    is_valid_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
-
-    if not (is_valid_user and is_valid_password):
+# 세션을 통해 인증된 사용자만 접근할 수 있도록 설정
+def verify_user(request: Request):
+    username = request.session.get("username")
+    if not username or username != ADMIN_USER:
         raise HTTPException(status_code=401, detail="아이디나 비밀번호가 올바르지 않습니다")
-    
-    return credentials.username
+    return username
+
 
 def load_pdf_text(pdf_path):
     """PDF 문서를 로드하고 텍스트를 추출"""
@@ -83,47 +101,65 @@ def load_pdf_text(pdf_path):
         text += page.get_text("text") + "\n"
     return text.strip()
 
+# 로그인 처리 엔드포인트
 @app.post("/admin/login")
-def login(user: str = Depends(verify_user)):
-    return {"message": f"{user} 계정으로 로그인"}
+def login(request: Request, login_data: LoginRequest):
+    if login_data.username == ADMIN_USER and login_data.password == ADMIN_PASSWORD:
+        request.session["username"] = login_data.username
+        return {"message": f"{login_data.username} 계정으로 로그인"}
+    else:
+        raise HTTPException(status_code=401, detail="아이디나 비밀번호가 올바르지 않습니다")
+
+
+# 로그아웃 처리 엔드포인트
+@app.post("/admin/logout")
+def logout(session: dict = Depends(lambda: {})):
+    session.pop("username", None)  # 세션에서 username 제거
+    return {"message": "로그아웃 성공"}
 
 # 문서 목록 조회 엔드포인트 (관리자만 접근)
 @app.get("/admin/documents")
 def get_documents(user: str = Depends(verify_user)):
-    # 업로드된 파일 목록 가져오기
     files = [file.name for file in UPLOAD_DIR.iterdir() if file.is_file()]
     return {"documents": files}
 
+# 파일 업로드 엔드포인트
 @app.post("/admin/upload")
 async def upload_document(file: UploadFile = File(...), user: str = Depends(verify_user)):
-    # 파일 확장자 확인
     if not (file.filename.endswith(".txt") or file.filename.endswith(".pdf")):
         raise HTTPException(status_code=400, detail="텍스트 파일(.txt)과 PDF 파일(.pdf)만 업로드할 수 있습니다.")
     
     file_path = UPLOAD_DIR / file.filename
-
-    # 파일을 저장
     with open(file_path, "wb") as f:
         content = await file.read()
         f.write(content)
 
-    # 파일에서 텍스트 추출
     if file.filename.endswith(".txt"):
         document_content = content.decode('utf-8')
     elif file.filename.endswith(".pdf"):
-        # PDF에서 텍스트 추출
         document_content = load_pdf_text(file_path)
 
     # 새로 업로드된 파일을 벡터 DB에 추가
-    new_document = {"content": document_content, "metadata": {"source": file.filename}}
-    vector_db.add_documents([new_document])  # FAISS에 새로운 문서 추가
-
-    # 벡터 DB를 다시 저장
+    doc_id = str(uuid.uuid4())
+    new_document = Document(page_content=document_content, metadata={"source": file.filename}, id=doc_id)
+    vector_db.add_documents([new_document])
     vector_db.save_local(faiss_index_path)
 
-    return {"message": f"파일 '{file.filename}'이 업로드되었습니다."}
+    id_map_path = Path("document_id_map.json")
+    if not id_map_path.exists():
+        id_map_path.write_text("{}")
 
-# 문서 다운로드 엔드포인트 (관리자만 접근)
+    with open(id_map_path, "r+", encoding="utf-8") as f:
+        id_map = json.load(f)
+        id_map[file.filename] = doc_id
+        f.seek(0)
+        f.truncate()
+        json.dump(id_map, f)
+
+    return {"message": f"파일 '{file.filename}'이 업로드되었습니다."}    
+
+
+# 문서 다운로드 엔드포인트
 @app.get("/admin/documents/{filename}")
 def get_document(filename: str, user: str = Depends(verify_user)):
     file_path = UPLOAD_DIR / filename
@@ -131,12 +167,28 @@ def get_document(filename: str, user: str = Depends(verify_user)):
         return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다")
 
-# 문서 삭제 엔드포인트 (관리자만 접근)
+# 문서 삭제 엔드포인트
 @app.delete("/admin/documents/{filename}")
 def delete_document(filename: str, user: str = Depends(verify_user)):
     file_path = UPLOAD_DIR / filename
     if file_path.exists():
         os.remove(file_path)
+ 
+	        # id 매핑 파일에서 id 조회
+        with open("document_id_map.json", "r+") as f:
+            id_map = json.load(f)
+            doc_id = id_map.get(filename)
+
+            if doc_id:
+                vector_db.delete(ids=[doc_id])
+                vector_db.save_local(faiss_index_path)
+
+                # 매핑에서도 제거
+                del id_map[filename]
+                f.seek(0)
+                f.truncate()
+                json.dump(id_map, f)	
+
         return {"message": f"파일 '{filename}'이 삭제되었습니다."}
     raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다")
 
